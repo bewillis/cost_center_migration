@@ -1,0 +1,14 @@
+# Environment files
+.env
+
+# Log files
+*.log
+
+# macOS files
+.DS_Store
+
+# PowerShell files
+*.ps1.bak
+
+# CSV files
+*.csv
