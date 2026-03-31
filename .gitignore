@@ -12,3 +12,6 @@
 
 # CSV files
 *.csv
+
+# Excel files
+*.xlsx
