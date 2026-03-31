@@ -28,7 +28,8 @@ The migration process consists of three scripts that work together:
 
 1. **Create-InvoiceSections.ps1** - Creates Azure Invoice Sections
 2. **Create-AzureSubscriptions.ps1** - Creates Azure Subscriptions under their respective Invoice Sections
-3. **Ensure-GitHubCostCenters.ps1** - Creates GitHub Cost Centers
+3. **Ensure-GitHubCostCenters.ps1** - Creates GitHub Cost Centers (organization-scoped endpoint)
+4. **Create-EnterpriseCostCenters.ps1** - Creates GitHub Cost Centers at enterprise billing scope
 
 All scripts:
 - Are fully idempotent (safe to run multiple times)
@@ -157,6 +158,32 @@ Finally, create the GitHub Cost Centers:
 **Output:**
 - Console: Color-coded progress and results
 - Log file: `Ensure-GitHubCostCenters_YYYYMMDD_HHmmss.log`
+
+### Step 4: Create Enterprise Cost Centers
+
+Use this script when your GitHub setup requires cost centers at enterprise level:
+
+```powershell
+# Dry-run mode (set DRY_RUN=true in .env)
+.\Create-EnterpriseCostCenters.ps1
+
+# Live mode (set DRY_RUN=false in .env)
+.\Create-EnterpriseCostCenters.ps1
+```
+
+Required `.env` values for this script:
+
+- `GITHUB_ENTERPRISE` - enterprise slug (for example: `reply`)
+- `GITHUB_PAT` - PAT with enterprise billing administration permissions
+- `DRY_RUN`
+- `CSV_FILE_PATH`
+
+Optional `.env` values:
+
+- `GITHUB_API_BASE_URL` - for GitHub Enterprise Server API hostname
+- `GITHUB_ENTERPRISE_COST_CENTER_ENDPOINT` - endpoint override for non-standard environments
+
+After cost centers are created, manually link organizations to Azure subscriptions in GitHub billing settings.
 
 ## Dry-Run Mode
 
