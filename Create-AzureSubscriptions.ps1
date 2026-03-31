@@ -70,6 +70,72 @@ function Write-ColorOutput {
     Write-Log -Message $cleanMessage -Level $Level
 }
 
+# Function to get retry delay (seconds) from throttling message
+function Get-RetryDelaySecondsFromError {
+    param(
+        [string]$ErrorMessage,
+        [int]$AttemptNumber,
+        [int]$MaxBackoffSeconds = 900
+    )
+
+    # Try to parse service-provided wait duration (example: "Retry in 00:09:06.7040634 minutes")
+    if ($ErrorMessage -match 'Retry\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?)') {
+        try {
+            $retrySpan = [TimeSpan]::Parse($matches[1])
+            $seconds = [Math]::Ceiling($retrySpan.TotalSeconds)
+            return [Math]::Min([int]$seconds, $MaxBackoffSeconds)
+        }
+        catch {
+            # Fall through to exponential backoff.
+        }
+    }
+
+    # Fallback: bounded exponential backoff with jitter.
+    $baseDelay = [Math]::Pow(2, [Math]::Min($AttemptNumber, 6))
+    $jitter = Get-Random -Minimum 0 -Maximum 5
+    $candidate = [int]([Math]::Ceiling($baseDelay + $jitter))
+    return [Math]::Min($candidate, $MaxBackoffSeconds)
+}
+
+# Function to create a subscription with throttling-aware retries
+function New-SubscriptionAliasWithRetry {
+    param(
+        [string]$AliasName,
+        [string]$SubscriptionName,
+        [string]$BillingScope,
+        [string]$Workload = 'Production',
+        [int]$MaxRetries = 4
+    )
+
+    for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            return New-AzSubscriptionAlias `
+                -AliasName $AliasName `
+                -SubscriptionName $SubscriptionName `
+                -BillingScope $BillingScope `
+                -Workload $Workload `
+                -ErrorAction Stop
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+            $isThrottle = $false
+
+            if ($errorMessage -match 'too many requests|throttl|429') {
+                $isThrottle = $true
+            }
+
+            if (-not $isThrottle -or $attempt -ge $MaxRetries) {
+                throw
+            }
+
+            $waitSeconds = Get-RetryDelaySecondsFromError -ErrorMessage $errorMessage -AttemptNumber ($attempt + 1)
+            $attemptDisplay = $attempt + 1
+            Write-ColorOutput "  ⚠ Throttled while creating '$SubscriptionName'. Retrying attempt $attemptDisplay/$MaxRetries after $waitSeconds second(s)..." -Color Yellow -Level "WARN"
+            Start-Sleep -Seconds $waitSeconds
+        }
+    }
+}
+
 # Function to check if Az.Subscription and Az.Billing modules are installed
 function Test-AzModules {
     $requiredModules = @('Az.Subscription', 'Az.Billing', 'Az.Accounts')
@@ -180,29 +246,41 @@ function Test-InvoiceSection {
     )
     
     try {
+            $cacheKey = "$BillingAccountId|$BillingProfileId"
+            if (-not $script:InvoiceSectionsCache) {
+                $script:InvoiceSectionsCache = @{}
+            }
+
+            if ($script:InvoiceSectionsCache.ContainsKey($cacheKey)) {
+                $allInvoiceSections = $script:InvoiceSectionsCache[$cacheKey]
+                Write-ColorOutput "  Using cached invoice sections ($($allInvoiceSections.Count) cached)" -Color Gray -Level "DEBUG"
+            }
+            else {
         # Use Azure CLI REST command (more reliable than PowerShell Invoke-RestMethod for billing API)
-        $allInvoiceSections = @()
-        $uri = "https://management.azure.com/providers/Microsoft.Billing/billingAccounts/$BillingAccountId/billingProfiles/$BillingProfileId/invoiceSections?api-version=2019-10-01-preview"
-        
-        do {
-            Write-ColorOutput "  Fetching page: $uri" -Color Gray -Level "DEBUG"
-            $invoiceSectionsJson = az rest --method get --url $uri 2>&1
+                $allInvoiceSections = @()
+                $uri = "https://management.azure.com/providers/Microsoft.Billing/billingAccounts/$BillingAccountId/billingProfiles/$BillingProfileId/invoiceSections?api-version=2019-10-01-preview"
             
-            if ($LASTEXITCODE -ne 0) {
-                throw "Azure CLI command failed: $invoiceSectionsJson"
+                do {
+                    Write-ColorOutput "  Fetching page: $uri" -Color Gray -Level "DEBUG"
+                    $invoiceSectionsJson = az rest --method get --url $uri 2>&1
+                
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Azure CLI command failed: $invoiceSectionsJson"
+                    }
+                
+                    $response = $invoiceSectionsJson | ConvertFrom-Json
+                
+                    if ($response.value) {
+                        $allInvoiceSections += $response.value
+                        Write-ColorOutput "  Retrieved $($response.value.Count) invoice sections from this page" -Color Gray -Level "DEBUG"
+                    }
+                
+                    $uri = $response.nextLink
+                } while ($uri)
+
+                $script:InvoiceSectionsCache[$cacheKey] = $allInvoiceSections
+                Write-ColorOutput "  Retrieved $($allInvoiceSections.Count) invoice sections from billing API" -Color Gray -Level "DEBUG"
             }
-            
-            $response = $invoiceSectionsJson | ConvertFrom-Json
-            
-            if ($response.value) {
-                $allInvoiceSections += $response.value
-                Write-ColorOutput "  Retrieved $($response.value.Count) invoice sections from this page" -Color Gray -Level "DEBUG"
-            }
-            
-            $uri = $response.nextLink
-        } while ($uri)
-        
-        Write-ColorOutput "  Retrieved $($allInvoiceSections.Count) invoice sections from billing API" -Color Gray -Level "DEBUG"
         
         # Find the specific invoice section by display name
         $section = $allInvoiceSections | Where-Object { $_.properties.displayName -eq $InvoiceSectionName }
@@ -277,11 +355,15 @@ try {
     $BillingProfileId = $envConfig['BILLING_PROFILE_ID']
     $DryRun = $envConfig['DRY_RUN'] -eq 'true'
     $CsvPath = $envConfig['CSV_FILE_PATH']
+    $CreateMaxRetries = if ($envConfig.ContainsKey('CREATE_SUBSCRIPTION_MAX_RETRIES')) { [int]$envConfig['CREATE_SUBSCRIPTION_MAX_RETRIES'] } else { 4 }
+    $CreateDelaySeconds = if ($envConfig.ContainsKey('CREATE_SUBSCRIPTION_DELAY_SECONDS')) { [int]$envConfig['CREATE_SUBSCRIPTION_DELAY_SECONDS'] } else { 5 }
     
     Write-ColorOutput "Tenant ID: $TenantId" -Color Cyan -Level "INFO"
     Write-ColorOutput "Billing Account: $BillingAccountId" -Color Cyan -Level "INFO"
     Write-ColorOutput "Billing Profile: $BillingProfileId" -Color Cyan -Level "INFO"
     Write-ColorOutput "Dry Run Mode: $DryRun" -Color $(if ($DryRun) { "Magenta" } else { "Yellow" }) -Level "INFO"
+    Write-ColorOutput "Create Max Retries: $CreateMaxRetries" -Color Cyan -Level "INFO"
+    Write-ColorOutput "Create Delay Seconds: $CreateDelaySeconds" -Color Cyan -Level "INFO"
     
     # Resolve relative path if needed
     if (-not [System.IO.Path]::IsPathRooted($CsvPath)) {
@@ -413,13 +495,18 @@ try {
                 # This example uses New-AzSubscriptionAlias which is common for MCA
                 
                 $aliasName = $subscriptionName -replace '[^a-zA-Z0-9-]', '-'
-                
-                $newSubscription = New-AzSubscriptionAlias `
+
+                if (($created -gt 0) -and ($CreateDelaySeconds -gt 0)) {
+                    Write-ColorOutput "  Waiting $CreateDelaySeconds second(s) before next create to reduce throttling risk..." -Color Gray -Level "DEBUG"
+                    Start-Sleep -Seconds $CreateDelaySeconds
+                }
+
+                $newSubscription = New-SubscriptionAliasWithRetry `
                     -AliasName $aliasName `
                     -SubscriptionName $subscriptionName `
                     -BillingScope "/providers/Microsoft.Billing/billingAccounts/$BillingAccountId/billingProfiles/$BillingProfileId/invoiceSections/$($invoiceSection.name)" `
                     -Workload 'Production' `
-                    -ErrorAction Stop
+                    -MaxRetries $CreateMaxRetries
                 
                 Write-ColorOutput "  ✓ Created successfully" -Color Green -Level "INFO"
                 Write-ColorOutput "  Subscription ID: $($newSubscription.Properties.SubscriptionId)" -Color Gray -Level "INFO"
